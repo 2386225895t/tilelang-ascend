@@ -1363,13 +1363,14 @@ void CodeGenTileLangAscendPto::CopyL1ToL0Codegen(const CallNode *call,
   bool transpose = (op_name.find(", true>") != std::string::npos);
 
   int32_t tile_col = src_shape_info.col;
-  int32_t tile_row =
-      is_a ? dst_shape_info.slice_row
-           : FindBestTileRowB(src_shape_info.row, dst_shape_info.slice_row);
-  int32_t num_tiles =
-      is_a ? src_shape_info.row / tile_row : src_shape_info.row / tile_row;
-  if (num_tiles < 1)
-    num_tiles = 1;
+  // For sliced L1 buffers (e.g. a 3D buffer sliced into chunks), use the
+  // valid row count of the current slice instead of the physical row count
+  // declared by the buffer. Otherwise FindBestTileRowB may return a tile_row
+  // larger than the L0B/L0A capacity, causing an out-of-bounds copy.
+  int32_t src_row = src_shape_info.is_slice ? src_shape_info.slice_valid_row
+                                            : src_shape_info.row;
+  int32_t tile_row = is_a ? dst_shape_info.slice_row
+                          : FindBestTileRowB(src_row, dst_shape_info.slice_row);
 
   int32_t tile_size = tile_row * tile_col;
 
@@ -1404,9 +1405,8 @@ void CodeGenTileLangAscendPto::CopyL1ToL0Codegen(const CallNode *call,
     std::string src_temp_name = GetTempVarName(src_shape_info.ub_name + "_zn");
     this->PrintIndent();
     this->stream << kAscendPtoScope << "TileMatL1ZN<" << dst_shape_info.type
-                 << ", " << tile_col << ", " << src_shape_info.row << ", "
-                 << tile_col << ", " << src_shape_info.row << "> "
-                 << src_temp_name << ";\n";
+                 << ", " << tile_col << ", " << src_row << ", " << tile_col
+                 << ", " << src_row << "> " << src_temp_name << ";\n";
     this->PrintIndent();
     this->stream << "TASSIGN(" << src_temp_name << ", "
                  << src_shape_info.first_addr << " + " << src_shape_info.offset
@@ -1421,7 +1421,7 @@ void CodeGenTileLangAscendPto::CopyL1ToL0Codegen(const CallNode *call,
                << ", " << dst_shape_info.slice_row << ", "
                << dst_shape_info.slice_col;
   if (transpose) {
-    this->stream << ", " << tile_col << ", " << src_shape_info.row << ", true";
+    this->stream << ", " << tile_col << ", " << src_row << ", true";
   } else {
     this->stream << ", " << tile_row << ", " << tile_col;
   }
