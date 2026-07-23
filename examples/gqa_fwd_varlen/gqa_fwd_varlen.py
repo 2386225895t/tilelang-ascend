@@ -6,7 +6,7 @@ import sys
 import torch
 
 import tilelang
-from tilelang import DataType, language as T
+from tilelang import language as T
 from tilelang.intrinsics import make_zn_layout, make_nz_layout
 from tilelang.profiler import do_bench
 
@@ -842,8 +842,6 @@ def _prepare_and_run(
     max_diff = (out_valid.float() - ref_valid.float()).abs().max().item()
     # golden_diff: self-written golden vs SDPA golden (cross-validation)
     golden_diff = (ref_valid.float() - ref_sdpa_valid.float()).abs().max().item()
-    # max_diff_sdpa: kernel vs SDPA golden (for diagnostics)
-    max_diff_sdpa = (out_valid.float() - ref_sdpa_valid.float()).abs().max().item()
 
     # Test passes only if kernel matches BOTH goldens within tolerance.
     try:
