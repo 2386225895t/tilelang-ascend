@@ -226,7 +226,7 @@ def run_one(
         print(f"  Golden:    {gold_ms:.4f} ms   {gold_tflops:.2f} TFlops")
         print(f"  Speedup:   {speedup:.2f}x  (TileLang vs PyTorch golden)")
 
-    return True 
+    return True
 
 
 def main():
