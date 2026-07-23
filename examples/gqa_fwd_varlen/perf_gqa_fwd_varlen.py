@@ -164,7 +164,7 @@ def run_one(
     torch.npu.synchronize()
     if torch.isnan(out).any():
         print("  [ERROR] kernel output contains NaN, skipping bench")
-        return
+        return False
     ref_out = ref_gqa_varlen_fwd_padded(
         q,
         k,
@@ -196,6 +196,9 @@ def run_one(
         ref_v = ref_v[non_nan]
     max_diff = (out_v.float() - ref_v.float()).abs().max().item()
     print(f"  correctness: max_diff={max_diff:.6e} (atol=1e-2)")
+    if max_diff >= 1e-2:
+        print(f"  [ERROR] correctness check failed: max_diff={max_diff:.6e} >= atol=1e-2")
+        return False
 
     # Bench TileLang kernel
     print("  benching TileLang kernel ...")
@@ -222,6 +225,8 @@ def run_one(
         speedup = gold_ms / tl_ms if tl_ms > 0 else float("inf")
         print(f"  Golden:    {gold_ms:.4f} ms   {gold_tflops:.2f} TFlops")
         print(f"  Speedup:   {speedup:.2f}x  (TileLang vs PyTorch golden)")
+
+    return True 
 
 
 def main():
@@ -255,11 +260,12 @@ def main():
     )
     args = parser.parse_args()
 
+    results = []
     device = "npu"
     dtype = torch.float16
 
     if args.preset == "default":
-        run_one(
+        results.append(run_one(
             "default",
             args.batch,
             args.heads,
@@ -276,10 +282,10 @@ def main():
             args.with_golden,
             device,
             dtype,
-        )
+        ))
     elif args.preset == "small":
         # Quick smoke run (faster compile + bench).
-        run_one(
+        results.append(run_one(
             "small",
             1,
             4,
@@ -296,14 +302,14 @@ def main():
             args.with_golden,
             device,
             dtype,
-        )
+        ))
     elif args.preset == "sweep":
         # Vary seqlen (the main perf axis for attention).
         print("=" * 70)
         print("Preset: sweep seqlen (batch=8, heads=64, groups=16, dim=128, non-causal)")
         print("=" * 70)
         for sq in [512, 1024, 2048, 4096]:
-            run_one(
+            results.append(run_one(
                 f"sq{sq}",
                 8,
                 64,
@@ -320,13 +326,13 @@ def main():
                 args.with_golden,
                 device,
                 dtype,
-            )
+            ))
     elif args.preset == "causal-sweep":
         print("=" * 70)
         print("Preset: causal-sweep (causal=True, vary seqlen)")
         print("=" * 70)
         for sq in [512, 1024, 2048, 4096]:
-            run_one(
+            results.append(run_one(
                 f"sq{sq}_causal",
                 8,
                 64,
@@ -343,9 +349,16 @@ def main():
                 args.with_golden,
                 device,
                 dtype,
-            )
+            ))
 
     print("\nDone.")
+    # CI compatibility: bench_test.sh marks a script PASSED only if stdout
+    # contains "Test Passed!" / "Kernel Output Match!". Print it when all
+    # run_one correctness checks passed; exit 1 otherwise.
+    if all(results):
+        print("Test Passed!")
+    else:
+        sys.exit(1)
 
 
 if __name__ == "__main__":

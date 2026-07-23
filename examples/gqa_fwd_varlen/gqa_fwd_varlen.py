@@ -521,3 +521,74 @@ def flashattn(
                 T.wait_flag("MTE3", "V", SIG_S_HALF)
 
     return main
+
+
+# ===========================================================================
+# Smoke test entry (CI compatibility)
+#
+# Repository CI (examples/bench_test.sh) marks a script PASSED only if its
+# stdout contains "Test Passed!" or "Kernel Output Match!". This __main__
+# runs the minimal L0 shape (l0_min_full_nc config) and validates against
+# F.scaled_dot_product_attention so the main file is independently runnable
+# in CI. The @tilelang.jit flashattn kernel above is unchanged.
+# ===========================================================================
+
+
+if __name__ == "__main__":
+    import torch.nn.functional as F
+
+    tilelang.disable_cache()
+    torch.set_default_device("npu")
+    torch.manual_seed(0)
+
+    # Minimal smoke test — matches L0 "l0_min_full_nc" config:
+    # batch=1, heads=4, groups=2, sq=skv=128, dim=128, non-causal, full padding.
+    batch, heads, groups = 1, 4, 2
+    sq, skv, dim = 128, 128, 128
+    is_causal = False
+    padding_mode = "full"
+    block_M, block_N = 128, 128
+    head_kv = heads // groups
+    atol = 1e-2
+
+    torch.manual_seed(0)
+    q = torch.randn(batch, heads, sq, dim, dtype=torch.float16, device="npu")
+    k = torch.randn(batch, head_kv, skv, dim, dtype=torch.float16, device="npu")
+    v = torch.randn(batch, head_kv, skv, dim, dtype=torch.float16, device="npu")
+
+    # Full padding -> all-visible mask (1.0). cu_seqlens consumed on host only.
+    q_mask = generate_random_padding_mask(sq, batch, "npu", mode=padding_mode)
+    k_mask = generate_random_padding_mask(skv, batch, "npu", mode=padding_mode)
+    cu_seqlens_q = mask_to_cu_seqlens(q_mask)
+    cu_seqlens_k = mask_to_cu_seqlens(k_mask)
+    attn_mask = build_attention_mask(cu_seqlens_q, cu_seqlens_k, sq, skv, is_causal, "npu")
+
+    # Non-causal + full padding + block-aligned -> mask is all 1.0 -> apply_mask=False.
+    apply_mask = is_causal or padding_mode != "full" or (sq % block_M != 0) or (skv % block_N != 0)
+    kernel = flashattn(
+        batch,
+        groups,
+        heads,
+        dim,
+        sq,
+        skv,
+        is_causal,
+        block_M=block_M,
+        block_N=block_N,
+        apply_mask=apply_mask,
+    )
+
+    out = kernel(q, k, v, attn_mask)
+    torch.npu.synchronize()
+
+    # Golden: SDPA with GQA repeat (NPU equivalent of flash_attn_varlen_func).
+    # SDPA scale defaults to 1/sqrt(dim), matching the kernel's sm_scale.
+    k_rep = k.repeat_interleave(groups, dim=1)  # [batch, heads, skv, dim]
+    v_rep = v.repeat_interleave(groups, dim=1)
+    ref_out = F.scaled_dot_product_attention(q, k_rep, v_rep, is_causal=False)
+    torch.npu.synchronize()
+
+    max_diff = (out.float() - ref_out.float()).abs().max().item()
+    print(f"max_diff: {max_diff:.6e}")
+    assert max_diff < atol, f"Precision check failed: max_diff={max_diff} >= atol={atol}"
+    print("Test Passed!")
