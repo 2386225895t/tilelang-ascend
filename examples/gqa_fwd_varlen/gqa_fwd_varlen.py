@@ -1,31 +1,4 @@
-# ruff: noqa
-"""GQA varlen Flash Attention forward (Ascend NPU, Expert mode).
 
-Expert-mode rewrite of the Developer version. The numerical flow (scale,
-mask-after-exp, online softmax, GQA, varlen 4D padded layout, causal
-right-aligned mask) is identical to the verified Developer version; only the
-programming model changes to Expert (manual CV separation, manual memory
-hierarchy, manual synchronization).
-
-Key Expert-mode features (see DESIGN.md revision=1 for full rationale):
-- ``pass_configs`` all False (manual CV / sync / memory planning)
-- ``T.alloc_L1/alloc_ub/alloc_L0C`` + ``T.annotate_address`` (manual hierarchy)
-- ``T.Scope("C")`` / ``T.Scope("V")`` (manual CV separation)
-- ``T.set_flag`` / ``T.wait_flag`` (fine-grained intra-core sync, replaces
-  barrier_all in V scope mask handling since iter3)
-- ``T.set_cross_flag`` / ``T.wait_cross_flag`` (manual inter-core sync, 6 semaphores)
-- ``workspace_idx=[5, 6, 7]`` (3 GM workspaces for CV data exchange)
-- ``is_npu=True`` implicit ``threads=2`` with ``vid`` split (block_M//2 per vid)
-- ``block_M=128`` (vid split gives 64 rows per vid)
-
-The structure directly follows ``examples/flash_attention/fa_opt/flash_attn_bhsd_expert_h16_d128.py``
-(the authoritative Expert FA optimized implementation). Additions vs that reference:
-- GQA: ``kv_head_idx = by // groups``
-- varlen: 4D padded layout + host-precomputed mask tensor
-- causal: host-precomputed mask (right-aligned)
-- mask-after-exp: ``T.tile.mul`` with 2-flag sync (SIG_MASK_FREE/SIG_MASK_READY),
-  replacing the barrier_all used in iter2 (fa_opt has no mask, so no sync needed)
-"""
 
 import argparse
 import sys
@@ -233,7 +206,10 @@ def ref_sdpa_padded(q, k, v, cu_seqlens_q, cu_seqlens_k, heads, groups, dim, is_
         if is_causal and sq == skv:
             # Standard causal mask == right-aligned when offset = 0
             out_b = torch.nn.functional.scaled_dot_product_attention(
-                q_b_4d, k_b_4d, v_b_4d, is_causal=True,
+                q_b_4d,
+                k_b_4d,
+                v_b_4d,
+                is_causal=True,
             )  # [1, heads, sq, dim]
         elif is_causal:
             # Right-aligned causal: query i attends to key j iff j <= i + offset.
@@ -246,11 +222,16 @@ def ref_sdpa_padded(q, k, v, cu_seqlens_q, cu_seqlens_k, heads, groups, dim, is_
             attn_mask = torch.zeros(sq, skv, device=q.device, dtype=torch.float32)
             attn_mask[~visible] = float("-inf")
             out_b = torch.nn.functional.scaled_dot_product_attention(
-                q_b_4d, k_b_4d, v_b_4d, attn_mask=attn_mask,
+                q_b_4d,
+                k_b_4d,
+                v_b_4d,
+                attn_mask=attn_mask,
             )  # [1, heads, sq, dim]
         else:
             out_b = torch.nn.functional.scaled_dot_product_attention(
-                q_b_4d, k_b_4d, v_b_4d,
+                q_b_4d,
+                k_b_4d,
+                v_b_4d,
             )  # [1, heads, sq, dim]
 
         out[b, :, :sq, :] = out_b[0].to(q.dtype)
@@ -1096,10 +1077,7 @@ def _run_boundary_case(name, batch, heads, groups, q_seqlen, k_seqlen, dim, is_c
         golden_diff = (ref_perm.float() - ref_sdpa_perm.float()).abs().max().item()
         max_diff_sdpa = (out_perm.float() - ref_sdpa_perm.float()).abs().max().item()
         torch.testing.assert_close(out_perm, ref_perm, rtol=rtol, atol=atol)
-        print(
-            f"[BOUNDARY_PASS] boundary {name} max_diff={max_diff:.6e} "
-            f"golden_diff={golden_diff:.6e} max_diff_sdpa={max_diff_sdpa:.6e}"
-        )
+        print(f"[BOUNDARY_PASS] boundary {name} max_diff={max_diff:.6e} golden_diff={golden_diff:.6e} max_diff_sdpa={max_diff_sdpa:.6e}")
     except Exception as e:
         print(f"[BOUNDARY_WARN] boundary {name}: {e}")
 
@@ -1136,8 +1114,7 @@ def test_gqa_fwd_varlen_boundary():
 # ===========================================================================
 
 
-def _perf_build_inputs(batch, heads, groups, q_seqlen, k_seqlen, dim, is_causal,
-                       padding_mode, device, dtype, block_M, block_N):
+def _perf_build_inputs(batch, heads, groups, q_seqlen, k_seqlen, dim, is_causal, padding_mode, device, dtype, block_M, block_N):
     """Build padded 4D inputs + mask tensor (mirrors _prepare_and_run)."""
     torch.manual_seed(0)
     head_kv = heads // groups
@@ -1157,7 +1134,12 @@ def _perf_build_inputs(batch, heads, groups, q_seqlen, k_seqlen, dim, is_causal,
     cu_seqlens_q = mask_to_cu_seqlens(q_mask)
     cu_seqlens_k = mask_to_cu_seqlens(k_mask)
     attn_mask = build_attention_mask(
-        cu_seqlens_q, cu_seqlens_k, padded_sq, padded_skv, is_causal, device,
+        cu_seqlens_q,
+        cu_seqlens_k,
+        padded_sq,
+        padded_skv,
+        is_causal,
+        device,
     )
     return q, k, v, attn_mask, cu_seqlens_q, cu_seqlens_k, padded_sq, padded_skv
 
@@ -1177,7 +1159,15 @@ def _bench_golden(q, k, v, cu_seqlens_q, cu_seqlens_k, heads, groups, dim, is_ca
 
     def f():
         ref_gqa_varlen_fwd_padded(
-            q, k, v, cu_seqlens_q, cu_seqlens_k, heads, groups, dim, is_causal,
+            q,
+            k,
+            v,
+            cu_seqlens_q,
+            cu_seqlens_k,
+            heads,
+            groups,
+            dim,
+            is_causal,
         )
         torch.npu.synchronize()
 
@@ -1194,9 +1184,24 @@ def _compute_flops(batch, heads, q_seqlen, k_seqlen, dim, is_causal):
     return total
 
 
-def run_perf_case(name, batch, heads, groups, q_seqlen, k_seqlen, dim, is_causal,
-                  padding_mode, block_M, block_N, num_stages, cross_interval,
-                  with_golden, device, dtype):
+def run_perf_case(
+    name,
+    batch,
+    heads,
+    groups,
+    q_seqlen,
+    k_seqlen,
+    dim,
+    is_causal,
+    padding_mode,
+    block_M,
+    block_N,
+    num_stages,
+    cross_interval,
+    with_golden,
+    device,
+    dtype,
+):
     """Run a single benchmark config: correctness check + latency (one pass)."""
     head_kv = heads // groups
     print(
@@ -1206,8 +1211,18 @@ def run_perf_case(name, batch, heads, groups, q_seqlen, k_seqlen, dim, is_causal
     )
 
     q, k, v, attn_mask, cu_seqlens_q, cu_seqlens_k, padded_sq, padded_skv = _perf_build_inputs(
-        batch, heads, groups, q_seqlen, k_seqlen, dim, is_causal,
-        padding_mode, device, dtype, block_M, block_N,
+        batch,
+        heads,
+        groups,
+        q_seqlen,
+        k_seqlen,
+        dim,
+        is_causal,
+        padding_mode,
+        device,
+        dtype,
+        block_M,
+        block_N,
     )
 
     has_block_padding = (q_seqlen % block_M != 0) or (k_seqlen % block_N != 0)
@@ -1215,10 +1230,17 @@ def run_perf_case(name, batch, heads, groups, q_seqlen, k_seqlen, dim, is_causal
 
     print("  compiling kernel ...")
     kernel = flashattn(
-        batch, groups, heads, dim,
-        padded_sq, padded_skv, is_causal,
-        block_M=block_M, block_N=block_N,
-        num_stages=num_stages, cross_interval=cross_interval,
+        batch,
+        groups,
+        heads,
+        dim,
+        padded_sq,
+        padded_skv,
+        is_causal,
+        block_M=block_M,
+        block_N=block_N,
+        num_stages=num_stages,
+        cross_interval=cross_interval,
         apply_mask=apply_mask,
     )
 
@@ -1229,7 +1251,15 @@ def run_perf_case(name, batch, heads, groups, q_seqlen, k_seqlen, dim, is_causal
         print("  [ERROR] kernel output contains NaN, skipping bench")
         return
     ref_out = ref_gqa_varlen_fwd_padded(
-        q, k, v, cu_seqlens_q, cu_seqlens_k, heads, groups, dim, is_causal,
+        q,
+        k,
+        v,
+        cu_seqlens_q,
+        cu_seqlens_k,
+        heads,
+        groups,
+        dim,
+        is_causal,
     )
     torch.npu.synchronize()
     q_mask = generate_random_padding_mask(q_seqlen, batch, device, mode=padding_mode)
@@ -1258,7 +1288,15 @@ def run_perf_case(name, batch, heads, groups, q_seqlen, k_seqlen, dim, is_causal
     if with_golden:
         print("  benching PyTorch golden ...")
         gold_ms = _bench_golden(
-            q, k, v, cu_seqlens_q, cu_seqlens_k, heads, groups, dim, is_causal,
+            q,
+            k,
+            v,
+            cu_seqlens_q,
+            cu_seqlens_k,
+            heads,
+            groups,
+            dim,
+            is_causal,
         )
         gold_tflops = flops / (gold_ms * 1e-3) * 1e-12
         speedup = gold_ms / tl_ms if tl_ms > 0 else float("inf")
@@ -1270,18 +1308,41 @@ def run_perf(args, device, dtype):
     """Dispatch the perf benchmark based on --preset."""
     if args.preset == "default":
         run_perf_case(
-            "default", args.batch, args.heads, args.groups,
-            args.q_seqlen, args.k_seqlen, args.dim, args.causal,
-            args.padding, args.block_M, args.block_N,
-            args.num_stages, args.cross_interval,
-            args.with_golden, device, dtype,
+            "default",
+            args.batch,
+            args.heads,
+            args.groups,
+            args.q_seqlen,
+            args.k_seqlen,
+            args.dim,
+            args.causal,
+            args.padding,
+            args.block_M,
+            args.block_N,
+            args.num_stages,
+            args.cross_interval,
+            args.with_golden,
+            device,
+            dtype,
         )
     elif args.preset == "small":
         run_perf_case(
-            "small", 1, 4, 2, 128, 128, 128, False, "full",
-            args.block_M, args.block_N,
-            args.num_stages, args.cross_interval,
-            args.with_golden, device, dtype,
+            "small",
+            1,
+            4,
+            2,
+            128,
+            128,
+            128,
+            False,
+            "full",
+            args.block_M,
+            args.block_N,
+            args.num_stages,
+            args.cross_interval,
+            args.with_golden,
+            device,
+            dtype,
         )
     elif args.preset == "sweep":
         print("=" * 70)
@@ -1289,10 +1350,22 @@ def run_perf(args, device, dtype):
         print("=" * 70)
         for sq in [512, 1024, 2048, 4096]:
             run_perf_case(
-                f"sq{sq}", 8, 64, 16, sq, sq, 128, False, "full",
-                args.block_M, args.block_N,
-                args.num_stages, args.cross_interval,
-                args.with_golden, device, dtype,
+                f"sq{sq}",
+                8,
+                64,
+                16,
+                sq,
+                sq,
+                128,
+                False,
+                "full",
+                args.block_M,
+                args.block_N,
+                args.num_stages,
+                args.cross_interval,
+                args.with_golden,
+                device,
+                dtype,
             )
     elif args.preset == "causal-sweep":
         print("=" * 70)
@@ -1300,10 +1373,22 @@ def run_perf(args, device, dtype):
         print("=" * 70)
         for sq in [512, 1024, 2048, 4096]:
             run_perf_case(
-                f"sq{sq}_causal", 8, 64, 16, sq, sq, 128, True, "full",
-                args.block_M, args.block_N,
-                args.num_stages, args.cross_interval,
-                args.with_golden, device, dtype,
+                f"sq{sq}_causal",
+                8,
+                64,
+                16,
+                sq,
+                sq,
+                128,
+                True,
+                "full",
+                args.block_M,
+                args.block_N,
+                args.num_stages,
+                args.cross_interval,
+                args.with_golden,
+                device,
+                dtype,
             )
     print("\nDone.")
 
@@ -1329,18 +1414,20 @@ def main():
     parser.add_argument("--k-seqlen", type=int, default=2048, help="K/V sequence length")
     parser.add_argument("--dim", type=int, default=128, help="head dim")
     parser.add_argument("--causal", action="store_true", help="causal attention")
-    parser.add_argument("--padding", default="full", choices=["full", "random", "third"],
-                        help="padding mode (full = no padding / max length)")
+    parser.add_argument(
+        "--padding", default="full", choices=["full", "random", "third"], help="padding mode (full = no padding / max length)"
+    )
     parser.add_argument("--block-M", type=int, default=128, help="Q block size")
     parser.add_argument("--block-N", type=int, default=128, help="K/V block size")
     parser.add_argument("--num-stages", type=int, default=8, help="pipeline depth")
-    parser.add_argument("--cross-interval", type=int, default=1,
-                        help="cross-core sync interval")
-    parser.add_argument("--with-golden", action="store_true",
-                        help="also benchmark PyTorch golden for speedup comparison")
-    parser.add_argument("--preset", default="default",
-                        choices=["default", "sweep", "small", "causal-sweep"],
-                        help="preset benchmark suite (overrides individual args)")
+    parser.add_argument("--cross-interval", type=int, default=1, help="cross-core sync interval")
+    parser.add_argument("--with-golden", action="store_true", help="also benchmark PyTorch golden for speedup comparison")
+    parser.add_argument(
+        "--preset",
+        default="default",
+        choices=["default", "sweep", "small", "causal-sweep"],
+        help="preset benchmark suite (overrides individual args)",
+    )
     args = parser.parse_args()
 
     tilelang.disable_cache()
@@ -1370,4 +1457,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
