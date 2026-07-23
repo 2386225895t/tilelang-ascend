@@ -265,57 +265,36 @@ def main():
     dtype = torch.float16
 
     if args.preset == "default":
-        results.append(run_one(
-            "default",
-            args.batch,
-            args.heads,
-            args.groups,
-            args.q_seqlen,
-            args.k_seqlen,
-            args.dim,
-            args.causal,
-            args.padding,
-            args.block_M,
-            args.block_N,
-            args.num_stages,
-            args.cross_interval,
-            args.with_golden,
-            device,
-            dtype,
-        ))
+        results.append(
+            run_one(
+                "default",
+                args.batch,
+                args.heads,
+                args.groups,
+                args.q_seqlen,
+                args.k_seqlen,
+                args.dim,
+                args.causal,
+                args.padding,
+                args.block_M,
+                args.block_N,
+                args.num_stages,
+                args.cross_interval,
+                args.with_golden,
+                device,
+                dtype,
+            )
+        )
     elif args.preset == "small":
         # Quick smoke run (faster compile + bench).
-        results.append(run_one(
-            "small",
-            1,
-            4,
-            2,
-            128,
-            128,
-            128,
-            False,
-            "full",
-            args.block_M,
-            args.block_N,
-            args.num_stages,
-            args.cross_interval,
-            args.with_golden,
-            device,
-            dtype,
-        ))
-    elif args.preset == "sweep":
-        # Vary seqlen (the main perf axis for attention).
-        print("=" * 70)
-        print("Preset: sweep seqlen (batch=8, heads=64, groups=16, dim=128, non-causal)")
-        print("=" * 70)
-        for sq in [512, 1024, 2048, 4096]:
-            results.append(run_one(
-                f"sq{sq}",
-                8,
-                64,
-                16,
-                sq,
-                sq,
+        results.append(
+            run_one(
+                "small",
+                1,
+                4,
+                2,
+                128,
+                128,
                 128,
                 False,
                 "full",
@@ -326,30 +305,59 @@ def main():
                 args.with_golden,
                 device,
                 dtype,
-            ))
+            )
+        )
+    elif args.preset == "sweep":
+        # Vary seqlen (the main perf axis for attention).
+        print("=" * 70)
+        print("Preset: sweep seqlen (batch=8, heads=64, groups=16, dim=128, non-causal)")
+        print("=" * 70)
+        for sq in [512, 1024, 2048, 4096]:
+            results.append(
+                run_one(
+                    f"sq{sq}",
+                    8,
+                    64,
+                    16,
+                    sq,
+                    sq,
+                    128,
+                    False,
+                    "full",
+                    args.block_M,
+                    args.block_N,
+                    args.num_stages,
+                    args.cross_interval,
+                    args.with_golden,
+                    device,
+                    dtype,
+                )
+            )
     elif args.preset == "causal-sweep":
         print("=" * 70)
         print("Preset: causal-sweep (causal=True, vary seqlen)")
         print("=" * 70)
         for sq in [512, 1024, 2048, 4096]:
-            results.append(run_one(
-                f"sq{sq}_causal",
-                8,
-                64,
-                16,
-                sq,
-                sq,
-                128,
-                True,
-                "full",
-                args.block_M,
-                args.block_N,
-                args.num_stages,
-                args.cross_interval,
-                args.with_golden,
-                device,
-                dtype,
-            ))
+            results.append(
+                run_one(
+                    f"sq{sq}_causal",
+                    8,
+                    64,
+                    16,
+                    sq,
+                    sq,
+                    128,
+                    True,
+                    "full",
+                    args.block_M,
+                    args.block_N,
+                    args.num_stages,
+                    args.cross_interval,
+                    args.with_golden,
+                    device,
+                    dtype,
+                )
+            )
 
     print("\nDone.")
     # CI compatibility: bench_test.sh marks a script PASSED only if stdout
