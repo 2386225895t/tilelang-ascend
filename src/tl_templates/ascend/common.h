@@ -1823,67 +1823,61 @@ Sum_experiment(const LocalTensor<T> &dst, const LocalTensor<T> &src,
   AscendC::Sum(dst, src, sumParams);
 }
 
-template <typename T, uint32_t M, uint32_t N>
-CATLASS_DEVICE void transpose_16x16(LocalTensor<T> const &dst,
+template <typename T, uint32_t H, uint32_t W>
+CATLASS_DEVICE void transpose_block(LocalTensor<T> const &dst,
                                     LocalTensor<T> const &src) {
-  TransDataTo5HDParams transDataParams;
-  transDataParams.dstHighHalf = false;
-  transDataParams.srcHighHalf = false;
-  transDataParams.repeatTimes = N;
-  if (transDataParams.repeatTimes == 1) {
-    transDataParams.dstRepStride = 0;
-    transDataParams.srcRepStride = 0;
-  } else {
-    transDataParams.dstRepStride = M;
-    transDataParams.srcRepStride = 1;
-  }
+  constexpr uint32_t blockSize = 32 / sizeof(T);
+  constexpr uint32_t highBlock = H / 16;
+  constexpr uint32_t repeat = W / blockSize;
+
+  TransDataTo5HDParams params;
+  params.dstHighHalf = false;
+  params.srcHighHalf = false;
+  params.repeatTimes = repeat;
+  params.dstRepStride = repeat > 1 ? H : 0;
+  params.srcRepStride = repeat > 1 ? 1 : 0;
 
   __ubuf__ T *dstList[16];
   __ubuf__ T *srcList[16];
 
-  if constexpr (sizeof(T) == 4) {
-    for (int32_t m = 0; m < 16; m = m + 2) {
-      dstList[m] = (__ubuf__ T *)dst[16 * (m / 2)].GetPhyAddr();
-      dstList[m + 1] = (__ubuf__ T *)dst[16 * (m / 2) + 16].GetPhyAddr();
-    }
-    for (int32_t n = 0; n < 16; n++) {
-      srcList[n] = (__ubuf__ T *)src[n * 16].GetPhyAddr();
-    }
-  } else {
-    for (int i = 0; i < 16; i++) {
-      dstList[i] = (__ubuf__ T *)dst[i * N].GetPhyAddr();
-      srcList[i] = (__ubuf__ T *)src[i * M].GetPhyAddr();
+  for (uint32_t i = 0; i < highBlock; i++) {
+    if constexpr (sizeof(T) == 2) {
+      for (int32_t m = 0; m < 16; m++)
+        dstList[m] = (__ubuf__ T *)dst[i * 16 + H * m].GetPhyAddr();
+      for (int32_t n = 0; n < 16; n++)
+        srcList[n] = (__ubuf__ T *)src[i * W * 16 + W * n].GetPhyAddr();
+      AscendC::TransDataTo5HDImpl<T>(dstList, srcList, params);
+    } else if constexpr (sizeof(T) == 4) {
+      for (int32_t m = 0; m < 16; m = m + 2) {
+        dstList[m] = (__ubuf__ T *)dst[i * 16 + H * (m / 2)].GetPhyAddr();
+        dstList[m + 1] =
+            (__ubuf__ T *)dst[i * 16 + H * (m / 2) + blockSize].GetPhyAddr();
+      }
+      for (int32_t n = 0; n < 16; n++)
+        srcList[n] = (__ubuf__ T *)src[i * W * 16 + W * n].GetPhyAddr();
+      AscendC::TransDataTo5HDImpl<T>(dstList, srcList, params);
     }
   }
-
-  AscendC::TransDataTo5HDImpl<T>(dstList, srcList, transDataParams);
   AscendC::PipeBarrier<PIPE_V>();
 }
 
 template <typename T, uint32_t FullM = 16, uint32_t FullN = 16>
 CATLASS_DEVICE void transpose(LocalTensor<T> const &dst,
                               LocalTensor<T> const &src) {
-  if constexpr (FullM == 16 && FullN == 16) {
-    if constexpr (sizeof(T) == 2) {
-      AscendC::Transpose(dst, src);
-    } else {
-      for (int i = 0; i < 16; i++) {
-        for (int j = 0; j < 16; j++) {
-          dst.SetValue(i * 16 + j, src.GetValue(j * 16 + i));
-        }
-      }
-    }
+  if constexpr (FullM == 16 && FullN == 16 && sizeof(T) == 2 &&
+                !std::is_same_v<T, bfloat16_t>) {
+    AscendC::Transpose(dst, src);
+    return;
+  }
+
+  if constexpr (FullM % 16 == 0 && FullN % 16 == 0 &&
+                (sizeof(T) == 2 || sizeof(T) == 4) &&
+                !std::is_same_v<T, bfloat16_t>) {
+    transpose_block<T, FullM, FullN>(dst, src);
   } else {
-    for (uint32_t ti = 0; ti < FullM / 16; ti++) {
-      for (uint32_t tj = 0; tj < FullN / 16; tj++) {
-        for (int i = 0; i < 16; i++) {
-          for (int j = 0; j < 16; j++) {
-            dst.SetValue((tj * 16 + j) * FullM + (ti * 16 + i),
-                         src.GetValue((ti * 16 + i) * FullN + (tj * 16 + j)));
-          }
-        }
-      }
-    }
+    for (uint32_t i = 0; i < FullM; i++)
+      for (uint32_t j = 0; j < FullN; j++)
+        dst.SetValue(j * FullM + i, src.GetValue(i * FullN + j));
   }
 }
 
