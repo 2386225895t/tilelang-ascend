@@ -143,7 +143,18 @@ CATLASS_DEVICE void mma(LocalTensor<T1> const A, LocalTensor<T1> const B,
   mmadParams.n = n_actual;
   mmadParams.k = K;
   mmadParams.cmatrixInitVal = init;
-  // mmadParams.unitFlag = unitFlag;
+  // MmadParams does not default-initialise cmatrixSource, and the hardware
+  // reads it whenever cmatrixInitVal == false (an accumulating mma, C sourced
+  // from L0C). A single-mma caller never notices, but a K-accumulating sequence
+  // that also sets unitFlag reads the uninitialised field and hangs the cube.
+  // false ("source from L0C") is what every accumulating caller already means.
+  mmadParams.cmatrixSource = false;
+  // unitFlag drives the hardware mma->fixpipe pipeline: 0b10 keeps the result
+  // in L0C, 0b11 releases it to a paired fixpipe. That is what lets
+  // fixpipe(tile i) overlap mma(tile i+1) across a two-slot L0C ping-pong,
+  // without a software M_FIX/FIX_M handshake. Defaults to 0 (off), so every
+  // existing caller is byte-for-byte unchanged.
+  mmadParams.unitFlag = unitFlag;
 
   Mmad(C, A, B, mmadParams);
 
@@ -159,7 +170,7 @@ template <typename T1, typename T2, typename LayoutGM, uint32_t srcM,
 CATLASS_DEVICE void
 copy_l0c_to_gm(GlobalTensor<T2> dstTensor, LocalTensor<T1> srcTensor,
                uint32_t realDstN = 1, uint32_t realTailM = 0,
-               uint32_t realTailN = 0) {
+               uint32_t realTailN = 0, uint8_t unitFlag = 0) {
   uint32_t tailM = realTailM == 0 ? srcM : realTailM;
   uint32_t tailN = realTailN == 0 ? srcN : realTailN;
   auto layoutInL0C = tla::MakeLayoutL0C(srcM, srcN);
@@ -176,7 +187,10 @@ copy_l0c_to_gm(GlobalTensor<T2> dstTensor, LocalTensor<T1> srcTensor,
   CopyL0CToGmTla<ArchTag, decltype(src), decltype(dst),
                  ScaleGranularity::NO_QUANT, enRelu>
       tileCopier;
-  tileCopier(dst, src, 0);
+  // unitFlag (default 0 = a standalone fixpipe) pairs with the Mmad unitFlag to
+  // form the hardware mma->fixpipe pipeline; CopyL0CToGmTla already plumbs it
+  // through to FixpipeParams.
+  tileCopier(dst, src, unitFlag);
 }
 
 template <uint32_t M, uint32_t N, uint32_t K, uint32_t block_M,
@@ -443,6 +457,45 @@ CATLASS_DEVICE void
 reduce_sum_half(LocalTensor<T> const &dstTensor,
                 LocalTensor<T> const &srcTensor, const int32_t mask,
                 const int32_t repeatTime, const int32_t srcRepStride) {
+  AscendC::WholeReduceSum<T>(dstTensor, srcTensor, mask, repeatTime, 1, 1,
+                             srcRepStride);
+}
+
+// Row-reduce a narrow column range of a wider tile.
+//
+// AscendC's Reduce* takes a {M, N} shape and reads the source as a CONTIGUOUS
+// M x N block, so it cannot express "N columns out of each row of a wider
+// buffer": for a [M, 512] tile and a logical width of 64 it reads elements
+// [0, M*64), which is row 0's first eight chunks, not the first 64 columns of
+// each of the M rows. WholeReduce* instead takes an explicit per-repeat source
+// stride, so one repeat per row with srcRepStride set to the PHYSICAL row width
+// reduces the intended region. One repeat covers at most 256 bytes, which is
+// what bounds the usable width.
+template <typename T>
+CATLASS_DEVICE void
+reduce_max_narrow(LocalTensor<T> const &dstTensor,
+                  LocalTensor<T> const &srcTensor, const int32_t mask,
+                  const int32_t repeatTime, const int32_t srcRepStride) {
+  AscendC::WholeReduceMax<T>(dstTensor, srcTensor, mask, repeatTime, 1, 1,
+                             srcRepStride,
+                             AscendC::ReduceOrder::ORDER_ONLY_VALUE);
+}
+
+template <typename T>
+CATLASS_DEVICE void
+reduce_min_narrow(LocalTensor<T> const &dstTensor,
+                  LocalTensor<T> const &srcTensor, const int32_t mask,
+                  const int32_t repeatTime, const int32_t srcRepStride) {
+  AscendC::WholeReduceMin<T>(dstTensor, srcTensor, mask, repeatTime, 1, 1,
+                             srcRepStride,
+                             AscendC::ReduceOrder::ORDER_ONLY_VALUE);
+}
+
+template <typename T>
+CATLASS_DEVICE void
+reduce_sum_narrow(LocalTensor<T> const &dstTensor,
+                  LocalTensor<T> const &srcTensor, const int32_t mask,
+                  const int32_t repeatTime, const int32_t srcRepStride) {
   AscendC::WholeReduceSum<T>(dstTensor, srcTensor, mask, repeatTime, 1, 1,
                              srcRepStride);
 }
@@ -889,57 +942,25 @@ CATLASS_DEVICE void tail_scalar(TailVecScalarOp op, LocalTensor<T> dst,
 }
 
 // ---- reduce ----
-// dim == -1 : reduce each row over its valid columns -> out[0..validRow).
-// dim == 0  : reduce down the valid rows           -> out[0..validCol).
+// The propagation pass emits this helper only for axis 0/-2: reduce down the
+// valid rows into out[0..validCol). `tmp`, `dim`, and `clear` stay in the ABI
+// shared with the native reduce call; this validated contract does not consume
+// tmp and always arrives normalized as dim == 0, clear == true.
 template <typename T>
 CATLASS_DEVICE void tail_reduce_sum(LocalTensor<T> out, LocalTensor<T> src,
                                     LocalTensor<uint8_t> tmp, int dim,
                                     uint32_t validRow, uint32_t validCol,
                                     uint32_t physCol, bool clear) {
+  (void)tmp;
+  (void)dim;
+  (void)clear;
   if (validRow == 0 || validCol == 0)
     return;
-  if (dim == 0) {
-    uint32_t r0 = 0;
-    if (clear) {
-      AscendC::Adds(out, src, static_cast<T>(0),
-                    static_cast<int32_t>(validCol));
-      r0 = 1;
-    }
-    for (uint32_t r = r0; r < validRow; ++r) {
-      AscendC::Add(out, out, src[r * physCol], static_cast<int32_t>(validCol));
-    }
-    return;
-  }
-  // dim == -1: reduce each row over its valid columns -> out[0..validRow).
-  // Use the proven Pattern-AR reduce: one contiguous block reduce when
-  // validCol == physCol, otherwise per-row (each row is contiguous internally).
-  // clear == false is handled by backing up the old result and merging.
-  constexpr uint32_t kTailMaxRows = 256;
-  T backup[kTailMaxRows];
-  bool merge = (!clear) && (validRow <= kTailMaxRows);
-  if (merge) {
-    for (uint32_t r = 0; r < validRow; ++r)
-      backup[r] = out.GetValue(r);
-  }
-  if (validCol == physCol) {
-    uint32_t shape[2] = {validRow, validCol};
-    AscendC::ReduceSum<T, AscendC::Pattern::Reduce::AR>(out, src, tmp, shape,
-                                                        true);
-  } else {
-    // validCol != physCol (tail columns): AR-pattern ReduceSum with a sub-tile
-    // shape {1, validCol} triggers aicore exceptions on some tiles, so fall
-    // back to explicit scalar accumulation (always correct; tail validCol is
-    // small so the cost is bounded). merge (clear==false) handled below.
-    for (uint32_t r = 0; r < validRow; ++r) {
-      T acc = static_cast<T>(0);
-      for (uint32_t c = 0; c < validCol; ++c)
-        acc = static_cast<T>(acc + src.GetValue(r * physCol + c));
-      out.SetValue(r, acc);
-    }
-  }
-  if (merge) {
-    for (uint32_t r = 0; r < validRow; ++r)
-      out.SetValue(r, static_cast<T>(out.GetValue(r) + backup[r]));
+  // Multiplication by one preserves signed zero while initializing the first
+  // row; Adds(..., 0) may canonicalize -0.0 on device.
+  AscendC::Muls(out, src, static_cast<T>(1), static_cast<int32_t>(validCol));
+  for (uint32_t r = 1; r < validRow; ++r) {
+    AscendC::Add(out, out, src[r * physCol], static_cast<int32_t>(validCol));
   }
 }
 
@@ -948,47 +969,14 @@ CATLASS_DEVICE void tail_reduce_max(LocalTensor<T> out, LocalTensor<T> src,
                                     LocalTensor<uint8_t> tmp, int dim,
                                     uint32_t validRow, uint32_t validCol,
                                     uint32_t physCol, bool clear) {
+  (void)tmp;
+  (void)dim;
+  (void)clear;
   if (validRow == 0 || validCol == 0)
     return;
-  if (dim == 0) {
-    uint32_t r0 = 0;
-    if (clear) {
-      AscendC::Adds(out, src, static_cast<T>(0),
-                    static_cast<int32_t>(validCol));
-      r0 = 1;
-    }
-    for (uint32_t r = r0; r < validRow; ++r) {
-      AscendC::Max(out, out, src[r * physCol], static_cast<int32_t>(validCol));
-    }
-    return;
-  }
-  // dim == -1: reduce each row over its valid columns (Pattern-AR).
-  constexpr uint32_t kTailMaxRows = 256;
-  T backup[kTailMaxRows];
-  bool merge = (!clear) && (validRow <= kTailMaxRows);
-  if (merge) {
-    for (uint32_t r = 0; r < validRow; ++r)
-      backup[r] = out.GetValue(r);
-  }
-  if (validCol == physCol) {
-    uint32_t shape[2] = {validRow, validCol};
-    AscendC::ReduceMax<T, AscendC::Pattern::Reduce::AR>(out, src, tmp, shape,
-                                                        true);
-  } else {
-    // validCol != physCol (tail columns): scalar fallback (see
-    // tail_reduce_sum).
-    for (uint32_t r = 0; r < validRow; ++r) {
-      T acc = src.GetValue(r * physCol);
-      for (uint32_t c = 1; c < validCol; ++c) {
-        T v = src.GetValue(r * physCol + c);
-        acc = reduce_scalar_max_safe(acc, v);
-      }
-      out.SetValue(r, acc);
-    }
-  }
-  if (merge) {
-    for (uint32_t r = 0; r < validRow; ++r)
-      out.SetValue(r, reduce_scalar_max_safe(out.GetValue(r), backup[r]));
+  AscendC::Muls(out, src, static_cast<T>(1), static_cast<int32_t>(validCol));
+  for (uint32_t r = 1; r < validRow; ++r) {
+    AscendC::Max(out, out, src[r * physCol], static_cast<int32_t>(validCol));
   }
 }
 
@@ -997,47 +985,14 @@ CATLASS_DEVICE void tail_reduce_min(LocalTensor<T> out, LocalTensor<T> src,
                                     LocalTensor<uint8_t> tmp, int dim,
                                     uint32_t validRow, uint32_t validCol,
                                     uint32_t physCol, bool clear) {
+  (void)tmp;
+  (void)dim;
+  (void)clear;
   if (validRow == 0 || validCol == 0)
     return;
-  if (dim == 0) {
-    uint32_t r0 = 0;
-    if (clear) {
-      AscendC::Adds(out, src, static_cast<T>(0),
-                    static_cast<int32_t>(validCol));
-      r0 = 1;
-    }
-    for (uint32_t r = r0; r < validRow; ++r) {
-      AscendC::Min(out, out, src[r * physCol], static_cast<int32_t>(validCol));
-    }
-    return;
-  }
-  // dim == -1: reduce each row over its valid columns (Pattern-AR).
-  constexpr uint32_t kTailMaxRows = 256;
-  T backup[kTailMaxRows];
-  bool merge = (!clear) && (validRow <= kTailMaxRows);
-  if (merge) {
-    for (uint32_t r = 0; r < validRow; ++r)
-      backup[r] = out.GetValue(r);
-  }
-  if (validCol == physCol) {
-    uint32_t shape[2] = {validRow, validCol};
-    AscendC::ReduceMin<T, AscendC::Pattern::Reduce::AR>(out, src, tmp, shape,
-                                                        true);
-  } else {
-    // validCol != physCol (tail columns): scalar fallback (see
-    // tail_reduce_sum).
-    for (uint32_t r = 0; r < validRow; ++r) {
-      T acc = src.GetValue(r * physCol);
-      for (uint32_t c = 1; c < validCol; ++c) {
-        T v = src.GetValue(r * physCol + c);
-        acc = reduce_scalar_min_safe(acc, v);
-      }
-      out.SetValue(r, acc);
-    }
-  }
-  if (merge) {
-    for (uint32_t r = 0; r < validRow; ++r)
-      out.SetValue(r, reduce_scalar_min_safe(out.GetValue(r), backup[r]));
+  AscendC::Muls(out, src, static_cast<T>(1), static_cast<int32_t>(validCol));
+  for (uint32_t r = 1; r < validRow; ++r) {
+    AscendC::Min(out, out, src[r * physCol], static_cast<int32_t>(validCol));
   }
 }
 
@@ -1770,67 +1725,61 @@ Sum_experiment(const LocalTensor<T> &dst, const LocalTensor<T> &src,
   AscendC::Sum(dst, src, sumParams);
 }
 
-template <typename T, uint32_t M, uint32_t N>
-CATLASS_DEVICE void transpose_16x16(LocalTensor<T> const &dst,
+template <typename T, uint32_t H, uint32_t W>
+CATLASS_DEVICE void transpose_block(LocalTensor<T> const &dst,
                                     LocalTensor<T> const &src) {
-  TransDataTo5HDParams transDataParams;
-  transDataParams.dstHighHalf = false;
-  transDataParams.srcHighHalf = false;
-  transDataParams.repeatTimes = N;
-  if (transDataParams.repeatTimes == 1) {
-    transDataParams.dstRepStride = 0;
-    transDataParams.srcRepStride = 0;
-  } else {
-    transDataParams.dstRepStride = M;
-    transDataParams.srcRepStride = 1;
-  }
+  constexpr uint32_t blockSize = 32 / sizeof(T);
+  constexpr uint32_t highBlock = H / 16;
+  constexpr uint32_t repeat = W / blockSize;
+
+  TransDataTo5HDParams params;
+  params.dstHighHalf = false;
+  params.srcHighHalf = false;
+  params.repeatTimes = repeat;
+  params.dstRepStride = repeat > 1 ? H : 0;
+  params.srcRepStride = repeat > 1 ? 1 : 0;
 
   __ubuf__ T *dstList[16];
   __ubuf__ T *srcList[16];
 
-  if constexpr (sizeof(T) == 4) {
-    for (int32_t m = 0; m < 16; m = m + 2) {
-      dstList[m] = (__ubuf__ T *)dst[16 * (m / 2)].GetPhyAddr();
-      dstList[m + 1] = (__ubuf__ T *)dst[16 * (m / 2) + 16].GetPhyAddr();
-    }
-    for (int32_t n = 0; n < 16; n++) {
-      srcList[n] = (__ubuf__ T *)src[n * 16].GetPhyAddr();
-    }
-  } else {
-    for (int i = 0; i < 16; i++) {
-      dstList[i] = (__ubuf__ T *)dst[i * N].GetPhyAddr();
-      srcList[i] = (__ubuf__ T *)src[i * M].GetPhyAddr();
+  for (uint32_t i = 0; i < highBlock; i++) {
+    if constexpr (sizeof(T) == 2) {
+      for (int32_t m = 0; m < 16; m++)
+        dstList[m] = (__ubuf__ T *)dst[i * 16 + H * m].GetPhyAddr();
+      for (int32_t n = 0; n < 16; n++)
+        srcList[n] = (__ubuf__ T *)src[i * W * 16 + W * n].GetPhyAddr();
+      AscendC::TransDataTo5HDImpl<T>(dstList, srcList, params);
+    } else if constexpr (sizeof(T) == 4) {
+      for (int32_t m = 0; m < 16; m = m + 2) {
+        dstList[m] = (__ubuf__ T *)dst[i * 16 + H * (m / 2)].GetPhyAddr();
+        dstList[m + 1] =
+            (__ubuf__ T *)dst[i * 16 + H * (m / 2) + blockSize].GetPhyAddr();
+      }
+      for (int32_t n = 0; n < 16; n++)
+        srcList[n] = (__ubuf__ T *)src[i * W * 16 + W * n].GetPhyAddr();
+      AscendC::TransDataTo5HDImpl<T>(dstList, srcList, params);
     }
   }
-
-  AscendC::TransDataTo5HDImpl<T>(dstList, srcList, transDataParams);
   AscendC::PipeBarrier<PIPE_V>();
 }
 
 template <typename T, uint32_t FullM = 16, uint32_t FullN = 16>
 CATLASS_DEVICE void transpose(LocalTensor<T> const &dst,
                               LocalTensor<T> const &src) {
-  if constexpr (FullM == 16 && FullN == 16) {
-    if constexpr (sizeof(T) == 2) {
-      AscendC::Transpose(dst, src);
-    } else {
-      for (int i = 0; i < 16; i++) {
-        for (int j = 0; j < 16; j++) {
-          dst.SetValue(i * 16 + j, src.GetValue(j * 16 + i));
-        }
-      }
-    }
+  if constexpr (FullM == 16 && FullN == 16 && sizeof(T) == 2 &&
+                !std::is_same_v<T, bfloat16_t>) {
+    AscendC::Transpose(dst, src);
+    return;
+  }
+
+  if constexpr (FullM % 16 == 0 && FullN % 16 == 0 &&
+                (sizeof(T) == 2 || sizeof(T) == 4) &&
+                !std::is_same_v<T, bfloat16_t>) {
+    transpose_block<T, FullM, FullN>(dst, src);
   } else {
-    for (uint32_t ti = 0; ti < FullM / 16; ti++) {
-      for (uint32_t tj = 0; tj < FullN / 16; tj++) {
-        for (int i = 0; i < 16; i++) {
-          for (int j = 0; j < 16; j++) {
-            dst.SetValue((tj * 16 + j) * FullM + (ti * 16 + i),
-                         src.GetValue((ti * 16 + i) * FullN + (tj * 16 + j)));
-          }
-        }
-      }
-    }
+    for (uint32_t i = 0; i < FullM; i++)
+      for (uint32_t j = 0; j < FullN; j++)
+        dst.SetValue(j * FullM + i, src.GetValue(i * FullN + j));
   }
 }
 
