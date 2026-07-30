@@ -110,9 +110,7 @@ def flashattn(
     assert num_stages % 2 == 0, "num_stages must be even for double buffering"
 
     num_q_blocks = seq_q // block_M
-    max_kv_iters = seq_kv // block_N
     block_num = num_q_blocks * heads * batch
-    num_outer = T.ceildiv(max_kv_iters, num_stages)
     # Causal right-aligned offset: query i sees key j iff j <= i + offset.
     # Used for per-q_block KV iteration cropping (Stage 3 iter1 optimization):
     # q_block bx only needs to iterate visible KV blocks, skipping fully-masked
@@ -122,6 +120,9 @@ def flashattn(
     # Flag safety: each task consumes 3 "next-batch" cross-flags at batch 0 and
     # produces 3 at its last batch (variable eff_num_outer) — identical accounting
     # to the fixed-num_outer case (leftovers carry to next task / init / destroy).
+    # Note: compile-time `num_outer = ceildiv(max_kv_iters, num_stages)` (and the
+    # `max_kv_iters = seq_kv // block_N` it derived from) was replaced by runtime
+    # `eff_kv_iters` / `eff_num_outer` in Stage 3 iter2 (see loop body below).
     causal_offset = seq_kv - seq_q
 
     # Stage 3 iter2: real (unpadded) dimensions for mask skip optimization.

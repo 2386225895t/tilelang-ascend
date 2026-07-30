@@ -614,7 +614,12 @@ def main():
     parser.add_argument("--window", type=int, default=None, help="[perf] sliding window size (default: None = full attention)")
     parser.add_argument("--block-M", type=int, default=128, help="[perf] Q block size (Expert kernel fixed at 128)")
     parser.add_argument("--block-N", type=int, default=128, help="[perf] K/V block size (Expert kernel fixed at 128)")
-    parser.add_argument("--with-golden", action="store_true", default=True, help="[perf] also benchmark PyTorch golden for speedup comparison (default: ON in 'default' mode)")
+    parser.add_argument(
+        "--with-golden",
+        action="store_true",
+        default=True,
+        help="[perf] also benchmark PyTorch golden for speedup comparison (default: ON in 'default' mode)",
+    )
     parser.add_argument(
         "--preset",
         default="default",
