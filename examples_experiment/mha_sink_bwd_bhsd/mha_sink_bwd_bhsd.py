@@ -12,7 +12,9 @@ from tilelang import language as T
 # This avoids duplicating the 700-line Expert CV-pipeline forward kernel and
 # guarantees numerical consistency between fwd (K1) and bwd (K3) — they share
 # the same lse definition, sm_scale, mask, and sink stabilization logic.
-_FWD_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "mha_sink_fwd_bhsd")
+# NOTE: fwd lives in examples/mha_sink_fwd_bhsd/ (high-perf dir), bwd lives in
+# examples_experiment/mha_sink_bwd_bhsd/ — reach fwd via ../../examples/.
+_FWD_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "examples", "mha_sink_fwd_bhsd")
 if _FWD_DIR not in sys.path:
     sys.path.insert(0, _FWD_DIR)
 from mha_sink_fwd_bhsd import (  # noqa: E402
