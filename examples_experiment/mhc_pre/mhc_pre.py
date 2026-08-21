@@ -314,7 +314,7 @@ def mhc_pre_big_fuse(
 # ===========================================================================
 
 
-@tilelang.jit(out_idx=[4, 5, 6], pass_configs=PASS_CONFIGS_DEV)
+@tilelang.jit(out_idx=[5, 6, 7], pass_configs=PASS_CONFIGS_DEV)
 def mhc_pre_fused(
     num_tokens,
     hidden_size,
@@ -331,19 +331,24 @@ def mhc_pre_fused(
     use_pipelined_gemm=True,
 ):
     """rev3 single-kernel fused (DESIGN.md rev3 Primary):
-    Kubecube GEMM (L0C->UB on-chip) + Vector sqrsum (parallel) + Vector tail
+    Cube GEMM (L0C->GM) + Vector sqrsum (parallel) + Vector tail
     (rms/mixes/pre/post/comb sinkhorn/layer_input), all in one kernel.
 
-    Developer mode: AUTO_CV_COMBINE splits Cube loop vs Vector loops; the only
-    C->V cross-core point is T.copy(out_l0c, gemm_out_ub) (AUTO_CV_SYNC).
-    No manual T.Scope / T.barrier_all; all GM writes via T.copy.
+    Developer mode: AUTO_CV_COMBINE splits Cube loop vs Vector loops; the
+    C->V cross-core point is L0C->GM write (Cube) then GM->UB read (Vector),
+    mediated by GM with AUTO_CV_SYNC. No manual T.Scope / T.barrier_all.
+
+    NOTE: The direct L0C->UB on-chip copy (T.copy(out_l0c, gemm_out_ub)) is
+    broken in newer tilelang (commit >= 386ae6ef) for certain shapes
+    (e.g. hidden_size=1280, D=5120). The GM round-trip (L0C->GM->UB) is a
+    workaround that trades one GM write+read for correctness. See debug_log.md.
 
     use_pipelined_gemm=True  -> K-loop T.Pipelined(num_stages=2) (V1, rev3)
     use_pipelined_gemm=False -> K-loop T.serial (v2-proven fallback, DESIGN §10)
 
     R3-iter1: hc_scale_exp [24] and hc_base [24] merged into hc_scale_base
     [2, 24] (row0=scale_exp, row1=base) -> 7 kernel args instead of 8 (launch
-    path per-arg cost ~30-60us, A/B 实测).
+    path per-arg cost ~30-60us, measured in A/B tests).
     """
     dtype = "bfloat16"
     accum_dtype = "float"
@@ -362,6 +367,7 @@ def mhc_pre_fused(
         residual_bf16: T.Tensor([num_tokens, hc_mult, hidden_size], dtype),  # type: ignore
         fn_bf16: T.Tensor([block_N_pad, D], dtype),  # type: ignore
         hc_scale_base: T.Tensor([2, hc_mult3], accum_dtype),  # type: ignore
+        gemm_out_gm: T.Tensor([num_tokens, block_N_pad], accum_dtype),  # type: ignore
         post_mix: T.Tensor([num_tokens, hc_mult], accum_dtype),  # type: ignore
         comb_mix: T.Tensor([num_tokens, hc_mult2], accum_dtype),  # type: ignore
         layer_input: T.Tensor([num_tokens, hidden_size], dtype),  # type: ignore
@@ -390,8 +396,8 @@ def mhc_pre_fused(
                         T.gemm_v0(x_l1, fn_l1, out_l0c, transpose_B=True, init=True)
                     else:
                         T.gemm_v0(x_l1, fn_l1, out_l0c, transpose_B=True)
-            gemm_out_ub = T.alloc_ub((block_M, block_N_pad), accum_dtype)
-            T.copy(out_l0c, gemm_out_ub)  # V2: L0C -> UB on-chip (C->V, AUTO_CV_SYNC)
+            # L0C -> GM (Cube GM write; AUTO_CV_SYNC handles C->V sync via GM)
+            T.copy(out_l0c, gemm_out_gm[cid * block_M, 0])
 
             # ============ Vector (AIV): bf16 sqrsum (serial, parallel to GEMM) ============
             x_ub = T.alloc_ub((sub_block_M, block_K), dtype)
@@ -424,13 +430,11 @@ def mhc_pre_fused(
                 T.tile.broadcast(rms_bcast_ub, rms_2d_ub)  # [sub,1] -> [sub,32]
 
                 # ---- Step 2: mixes = gemm_out * rms * scale + base ----
-                # Extract per-vid gemm rows from LOCAL UB gemm_out_ub (1D UB->UB
-                # 128B copies). NOTE: gemm_out_ub is block-local [64,32], so the
-                # row index must be vid*sub_block_M + i (NOT global row_base —
-                # that would be UB OOB for cid >= 1!)
+                # Read gemm rows from GM (L0C->GM->UB round-trip, avoids broken
+                # direct L0C->UB cross-core copy in newer tilelang).
                 mixes_ub = T.alloc_ub((sub_block_M, block_N_pad), accum_dtype)
                 for i in T.serial(sub_block_M):
-                    T.copy(gemm_out_ub[vid * sub_block_M + i, :], mixes_ub[i, :])
+                    T.copy(gemm_out_gm[row_base + i, 0:block_N_pad], mixes_ub[i, :])
                 T.tile.mul(mixes_ub, mixes_ub, rms_bcast_ub)
 
                 scale_ub = T.alloc_ub((1, block_N_pad), accum_dtype)
@@ -640,6 +644,8 @@ def mhc_pre(
         _hidden_block_cache[hidden_size] = hidden_block
 
     # ---- Run rev3 single fused kernel (all in one launch) ----
+    block_N_pad = 32
+    gemm_out_gm = torch.zeros(num_tokens, block_N_pad, dtype=torch.float, device=device)
     kernel_fused = mhc_pre_fused(
         num_tokens,
         hidden_size,
@@ -651,7 +657,7 @@ def mhc_pre(
         sinkhorn_repeat,
         hidden_block=hidden_block,
     )
-    post_mix, comb_mix, layer_input = kernel_fused(x_bf16, residual_flat, fn_bf16, hc_scale_base)
+    post_mix, comb_mix, layer_input = kernel_fused(x_bf16, residual_flat, fn_bf16, hc_scale_base, gemm_out_gm)
     # NOTE: no final torch.npu.synchronize() — NPU stream guarantees in-order
     # execution; callers needing results on CPU trigger implicit sync. (iter11/14c)
 
@@ -693,4 +699,22 @@ if __name__ == "__main__":
     assert torch.isfinite(post_mix).all()
     assert torch.isfinite(comb_mix).all()
     assert torch.isfinite(layer_input).all()
+
+    # ---- Small precision check against golden reference ----
+    residual_flat = residual.view(-1, hc_mult, hidden_size).float()
+    D = hc_mult * hidden_size
+    sqrsum = residual_flat.view(n, D).square().sum(-1)
+    mixes = residual_flat.view(n, D) @ fn.T.float() * (sqrsum.unsqueeze(-1) / D + 1e-6).rsqrt()
+    scale_exp = torch.cat(
+        [
+            hc_scale[0].expand(hc_mult),
+            hc_scale[1].expand(hc_mult),
+            hc_scale[2].expand(hc_mult * hc_mult),
+        ]
+    )
+    mixes = mixes * scale_exp + hc_base
+    post_ref = torch.sigmoid(mixes[:, hc_mult : 2 * hc_mult])
+    post_err = (post_mix.view(n, hc_mult).float() - post_ref).abs().max().item()
+    assert post_err < 1e-3, f"post_mix precision check failed: err={post_err:.4e}"
+    print(f"  post_mix max err: {post_err:.4e}")
     print("Test Passed!")
