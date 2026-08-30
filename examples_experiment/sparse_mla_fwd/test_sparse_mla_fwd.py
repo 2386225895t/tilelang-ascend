@@ -1,4 +1,3 @@
-# ruff: noqa
 import argparse
 import os
 import sys
@@ -15,10 +14,11 @@ from sparse_mla_fwd import (  # noqa: E402
     make_indices,
 )
 
-# L0 configs: (name, B, S, SKV, H, HKV, DQK, DV, topk) — DESIGN.md §10.2
+# L0 configs: (name, B, S, SKV, H, HKV, DQK, DV, topk)
 L0_CONFIGS = [
     ("l0_min", 1, 128, 128, 16, 1, 576, 512, 64),
     ("l0_default", 1, 4096, 4096, 128, 1, 576, 512, 2048),
+    ("l0_long_kv", 1, 4096, 8192, 128, 1, 576, 512, 2048),
     ("l0_multi_batch", 2, 1024, 1024, 64, 1, 576, 512, 512),
     ("l0_gqa", 1, 2048, 2048, 128, 2, 576, 512, 1024),
     ("l0_large_topk", 1, 512, 4096, 128, 1, 576, 512, 4096),
@@ -91,7 +91,7 @@ def _prepare_and_run(B, S, SKV, H, HKV, DQK, DV, topk, device="npu", atol=ATOL, 
 
 
 def test_l0():
-    """L0 gate tests: 5 regular shapes from DESIGN.md §10.2. All must PASS."""
+    """L0 gate tests: 6 regular shapes. All must PASS."""
     device = "npu"
     ok = True
     for name, b, s, skv, h, hkv, dqk, dv, tk in L0_CONFIGS:
