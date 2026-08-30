@@ -22,10 +22,6 @@ def sparse_mla_fwd(
     block_I=64,
 ):
 
-    # Dynamic (symbolic) shape axes: a kernel compiled once serves any
-    # batch / seq_len / seq_len_kv, so new shapes do not trigger recompiles.
-    # Static tuning params (heads / dim / tail_dim / topk / kv_group /
-    # block_I) still key the cache.
     batch = T.symbolic("batch")
     seq_len = T.symbolic("seq_len")
     seq_len_kv = T.symbolic("seq_len_kv")
@@ -419,8 +415,6 @@ def make_indices(B, S, SKV, HKV, topk, device="npu"):
 
 
 if __name__ == "__main__":
-    # Runtime-only configuration (kept out of module import to avoid
-    # import-time side effects).
     torch.set_default_device("npu")
     torch.manual_seed(0)
     tilelang.disable_cache()
